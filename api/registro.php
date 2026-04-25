@@ -18,12 +18,25 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     resposta(false, null, 'Método não permitido. Use POST.', 405);
 }
 
-// ─── Leitura e validação do corpo JSON ─────────────
+// ─── Validação de CSRF Token ───────────────────────
 $corpo = json_decode(file_get_contents('php://input'), true);
 
 if (!$corpo || !is_array($corpo)) {
     resposta(false, null, 'Corpo da requisição inválido. Envie JSON.', 400);
 }
+
+$csrfToken = $corpo['csrf_token'] ?? '';
+if (!validateCsrfToken($csrfToken)) {
+    resposta(false, null, 'Token CSRF inválido. Tente novamente.', 403);
+}
+
+// ─── Rate Limiting ─────────────────────────────────
+$ipReal = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+if (!checkRateLimit($ipReal, limit: 5, window: 60)) {
+    resposta(false, null, 'Muitas requisições. Tente novamente em alguns minutos.', 429);
+}
+
+// ─── Leitura e validação dos dados ─────────────────
 
 $bairroId    = isset($corpo['bairro_id'])    ? (int) $corpo['bairro_id']    : 0;
 $sintomas    = isset($corpo['sintomas'])     ? (array) $corpo['sintomas']   : [];
@@ -60,7 +73,6 @@ if (!$stmtBairro->fetch()) {
 }
 
 // ─── Anonimização do IP ─────────────────────────────
-$ipReal = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
 $ipHash = hash('sha256', $ipReal . date('Y-m-d')); // Muda a cada dia (privacidade extra)
 
 // ─── Inserção no banco ─────────────────────────────
@@ -82,41 +94,34 @@ try {
         $stmtSint->execute([$registroId, $sintoma]);
     }
 
-    // ─── Verifica limiar de alerta ─────────────────
-    // Se nas últimas 24h houver >= 5 registros de febre no bairro, gera alerta
-    $stmtContagem = $db->prepare('
-        SELECT COUNT(*) AS total
-        FROM registro_sintomas rs
-        JOIN registros r ON r.id = rs.registro_id
-        WHERE r.bairro_id = ?
-          AND rs.sintoma = "febre"
-          AND r.criado_em >= NOW() - INTERVAL 24 HOUR
-    ');
-    $stmtContagem->execute([$bairroId]);
-    $totalFebre = (int) $stmtContagem->fetchColumn();
 
-    if ($totalFebre >= 5) {
-        // Atualiza ou cria alerta para o bairro
-        $stmtAlerta = $db->prepare('
-            INSERT INTO alertas (bairro_id, nivel, mensagem)
-            VALUES (?, "alto", CONCAT("Atenção: ", ? ," registros de febre nas últimas 24h neste bairro."))
-            ON DUPLICATE KEY UPDATE
-              nivel = "alto",
-              mensagem = CONCAT("Atenção: ", ? ," registros de febre nas últimas 24h neste bairro."),
-              ativo = 1,
-              atualizado = NOW()
+    // ─── Verifica limiar de alerta para cada sintoma ─────────────
+    $limiares = [
+        'febre' => 5,
+        'tosse' => 7,
+        'diarreia' => 3,
+        // Adicione outros sintomas e limiares conforme necessário
+    ];
+    foreach ($limiares as $sintomaAlerta => $limite) {
+        $stmtContagem = $db->prepare('
+            SELECT COUNT(*) AS total
+            FROM registro_sintomas rs
+            JOIN registros r ON r.id = rs.registro_id
+            WHERE r.bairro_id = ?
+              AND rs.sintoma = ?
+              AND r.criado_em >= NOW() - INTERVAL 24 HOUR
         ');
-        // Simplificado: apenas insere novo alerta se não existir um ativo
-        $stmtAlertaExiste = $db->prepare(
-            'SELECT id FROM alertas WHERE bairro_id = ? AND ativo = 1 LIMIT 1'
-        );
-        $stmtAlertaExiste->execute([$bairroId]);
-
-        if (!$stmtAlertaExiste->fetch()) {
-            $nomeBairro = $db->query("SELECT nome FROM bairros WHERE id = $bairroId")->fetchColumn();
-            $msg = "$nomeBairro: $totalFebre registros de febre nas últimas 24h. Possível surto em desenvolvimento.";
-            $db->prepare('INSERT INTO alertas (bairro_id, nivel, mensagem) VALUES (?, "alto", ?)')
-               ->execute([$bairroId, $msg]);
+        $stmtContagem->execute([$bairroId, $sintomaAlerta]);
+        $totalSintoma = (int) $stmtContagem->fetchColumn();
+        if ($totalSintoma >= $limite) {
+            $stmtAlertaExiste = $db->prepare('SELECT id FROM alertas WHERE bairro_id = ? AND ativo = 1 AND mensagem LIKE ? LIMIT 1');
+            $stmtAlertaExiste->execute([$bairroId, "%$sintomaAlerta%"]);
+            if (!$stmtAlertaExiste->fetch()) {
+                $nomeBairro = $db->query("SELECT nome FROM bairros WHERE id = $bairroId")->fetchColumn();
+                $msg = "$nomeBairro: $totalSintoma registros de $sintomaAlerta nas últimas 24h. Possível surto em desenvolvimento.";
+                $db->prepare('INSERT INTO alertas (bairro_id, nivel, mensagem) VALUES (?, "alto", ?)')
+                   ->execute([$bairroId, $msg]);
+            }
         }
     }
 

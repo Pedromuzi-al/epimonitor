@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>EpiMonitor</title>
+    <title>epimonitor</title>
 </head>
 <body>
 
